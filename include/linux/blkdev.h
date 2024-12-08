@@ -295,6 +295,7 @@ struct blk_queue_ctx;
 
 typedef void (request_fn_proc) (struct request_queue *q);
 typedef blk_qc_t (make_request_fn) (struct request_queue *q, struct bio *bio);
+typedef bool (poll_q_fn) (struct request_queue *q, blk_qc_t);
 typedef int (prep_rq_fn) (struct request_queue *, struct request *);
 typedef void (unprep_rq_fn) (struct request_queue *, struct request *);
 
@@ -437,6 +438,7 @@ struct request_queue {
 
 	request_fn_proc		*request_fn;
 	make_request_fn		*make_request_fn;
+	poll_q_fn		*poll_fn;
 	prep_rq_fn		*prep_rq_fn;
 	unprep_rq_fn		*unprep_rq_fn;
 	softirq_done_fn		*softirq_done_fn;
@@ -1027,7 +1029,7 @@ extern void blk_execute_rq_nowait(struct request_queue *, struct gendisk *,
 int blk_status_to_errno(blk_status_t status);
 blk_status_t errno_to_blk_status(int errno);
 
-bool blk_mq_poll(struct request_queue *q, blk_qc_t cookie);
+bool blk_poll(struct request_queue *q, blk_qc_t cookie);
 
 static inline struct request_queue *bdev_get_queue(struct block_device *bdev)
 {
@@ -1386,6 +1388,7 @@ static inline struct request *blk_map_queue_find_tag(struct blk_queue_tag *bqt,
 }
 
 extern int blkdev_issue_flush(struct block_device *, gfp_t, sector_t *);
+extern void blkdev_issue_flush_nowait(struct block_device *, gfp_t);
 extern int blkdev_issue_write_same(struct block_device *bdev, sector_t sector,
 		sector_t nr_sects, gfp_t gfp_mask, struct page *page);
 
@@ -1777,42 +1780,33 @@ int kblockd_schedule_delayed_work_on(int cpu, struct delayed_work *dwork, unsign
 int kblockd_mod_delayed_work_on(int cpu, struct delayed_work *dwork, unsigned long delay);
 
 #ifdef CONFIG_BLK_CGROUP
-/*
- * This should not be using sched_clock(). A real patch is in progress
- * to fix this up, until that is in place we need to disable preemption
- * around sched_clock() in this function and set_io_start_time_ns().
- */
 static inline void set_start_time_ns(struct request *req)
 {
-	preempt_disable();
-	req->start_time_ns = sched_clock();
-	preempt_enable();
+	req->start_time_ns = ktime_get_ns();
 }
 
 static inline void set_io_start_time_ns(struct request *req)
 {
-	preempt_disable();
-	req->io_start_time_ns = sched_clock();
-	preempt_enable();
+	req->io_start_time_ns = ktime_get_ns();
 }
 
-static inline uint64_t rq_start_time_ns(struct request *req)
+static inline u64 rq_start_time_ns(struct request *req)
 {
         return req->start_time_ns;
 }
 
-static inline uint64_t rq_io_start_time_ns(struct request *req)
+static inline u64 rq_io_start_time_ns(struct request *req)
 {
         return req->io_start_time_ns;
 }
 #else
 static inline void set_start_time_ns(struct request *req) {}
 static inline void set_io_start_time_ns(struct request *req) {}
-static inline uint64_t rq_start_time_ns(struct request *req)
+static inline u64 rq_start_time_ns(struct request *req)
 {
 	return 0;
 }
-static inline uint64_t rq_io_start_time_ns(struct request *req)
+static inline u64 rq_io_start_time_ns(struct request *req)
 {
 	return 0;
 }
@@ -2046,43 +2040,26 @@ static const u_int64_t latency_x_axis_us[] = {
 #define BLK_IO_LAT_HIST_ZERO            2
 
 struct io_latency_state {
-	u_int64_t	latency_y_axis_read[ARRAY_SIZE(latency_x_axis_us) + 1];
-	u_int64_t	latency_reads_elems;
-	u_int64_t	latency_y_axis_write[ARRAY_SIZE(latency_x_axis_us) + 1];
-	u_int64_t	latency_writes_elems;
+	u_int64_t	latency_y_axis[ARRAY_SIZE(latency_x_axis_us) + 1];
+	u_int64_t	latency_elems;
+	u_int64_t	latency_sum;
 };
 
 static inline void
-blk_update_latency_hist(struct io_latency_state *s,
-			int read,
-			u_int64_t delta_us)
+blk_update_latency_hist(struct io_latency_state *s, u_int64_t delta_us)
 {
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(latency_x_axis_us); i++) {
-		if (delta_us < (u_int64_t)latency_x_axis_us[i]) {
-			if (read)
-				s->latency_y_axis_read[i]++;
-			else
-				s->latency_y_axis_write[i]++;
+	for (i = 0; i < ARRAY_SIZE(latency_x_axis_us); i++)
+		if (delta_us < (u_int64_t)latency_x_axis_us[i])
 			break;
-		}
-	}
-	if (i == ARRAY_SIZE(latency_x_axis_us)) {
-		/* Overflowed the histogram */
-		if (read)
-			s->latency_y_axis_read[i]++;
-		else
-			s->latency_y_axis_write[i]++;
-	}
-	if (read)
-		s->latency_reads_elems++;
-	else
-		s->latency_writes_elems++;
+	s->latency_y_axis[i]++;
+	s->latency_elems++;
+	s->latency_sum += delta_us;
 }
 
-void blk_zero_latency_hist(struct io_latency_state *s);
-ssize_t blk_latency_hist_show(struct io_latency_state *s, char *buf);
+ssize_t blk_latency_hist_show(char *name, struct io_latency_state *s,
+		char *buf, int buf_size);
 
 #else /* CONFIG_BLOCK */
 
@@ -2127,6 +2104,10 @@ static inline int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
 				     sector_t *error_sector)
 {
 	return 0;
+}
+
+static inline void blkdev_issue_flush_nowait(struct block_device *bdev, gfp_t gfp_mask)
+{
 }
 
 #endif /* CONFIG_BLOCK */
